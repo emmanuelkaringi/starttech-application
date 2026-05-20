@@ -52,7 +52,7 @@ jobs:
         working-directory: ./frontend
         run: npm run build
         env:
-          VITE_API_URL: ${{ secrets.VITE_API_URL }}
+          VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -83,23 +83,57 @@ jobs:
 
       - name: Deploy to S3
         run: |
+          # Find the frontend bucket
           BUCKET_NAME=$(aws s3api list-buckets --query "Buckets[?starts_with(Name, 'starttech-frontend-production')].Name" --output text)
+          
+          if [ -z "$BUCKET_NAME" ]; then
+            echo "Error: Frontend S3 bucket not found"
+            exit 1
+          fi
+          
           echo "Deploying to bucket: $BUCKET_NAME"
-          aws s3 sync dist/ s3://$BUCKET_NAME/ --delete --cache-control "max-age=31536000,public"
+          
+          # Sync build files to S3
+          aws s3 sync dist/ s3://$BUCKET_NAME/ --delete \
+            --cache-control "max-age=3600,public" \
+            --exclude "*.html" \
+            --exclude "asset-manifest.json"
+          
+          # HTML files with no cache
+          aws s3 sync dist/ s3://$BUCKET_NAME/ --delete \
+            --cache-control "no-cache,no-store,must-revalidate" \
+            --include "*.html" \
+            --include "asset-manifest.json"
+          
           echo "Deployment to S3 complete!"
 
       - name: Invalidate CloudFront cache
         run: |
-          DISTRIBUTION_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[?starts_with(Comment, '')].Id" --output text)
+          # Find CloudFront distribution
+          DISTRIBUTION_ID=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Origins.Items[?starts_with(DomainName, 'starttech-frontend-production')]].Id" \
+            --output text)
+          
           if [ -n "$DISTRIBUTION_ID" ]; then
             aws cloudfront create-invalidation --distribution-id $DISTRIBUTION_ID --paths "/*"
             echo "CloudFront invalidation created for distribution: $DISTRIBUTION_ID"
           else
-            echo "No CloudFront distribution found"
+            echo "Warning: CloudFront distribution not found"
           fi
+
+      - name: Verify deployment
+        run: |
+          # Get CloudFront domain
+          CLOUDFRONT_DOMAIN=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[0].DomainName" \
+            --output text)
+          
+          echo "================================================"
+          echo "Frontend deployed successfully!"
+          echo "CloudFront URL: https://$CLOUDFRONT_DOMAIN"
+          echo "================================================"
 
       - name: Send notification
         if: always()
         run: |
           echo "Frontend deployment completed with status: ${{ job.status }}"
-          # Add Slack/Email notification here if needed

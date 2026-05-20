@@ -15,7 +15,6 @@ on:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: starttech-backend
-  DOCKER_IMAGE_TAG: ${{ github.sha }}
 
 jobs:
   test:
@@ -77,24 +76,27 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build Docker image
-        working-directory: ./backend
-        run: |
-          docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.DOCKER_IMAGE_TAG }} .
-          docker tag ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.DOCKER_IMAGE_TAG }} ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Scan Docker image
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.DOCKER_IMAGE_TAG }}
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
           format: 'table'
           exit-code: '0'
           severity: 'CRITICAL,HIGH'
-
-      - name: Push to ECR
-        run: |
-          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.DOCKER_IMAGE_TAG }}
-          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
 
   deploy:
     name: Deploy to EC2
@@ -118,42 +120,71 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Get Redis endpoint
+        id: redis
         run: |
-          REDIS_ENDPOINT=$(aws elasticache describe-cache-clusters --cache-cluster-id starttech-redis-production --query "CacheClusters[0].CacheNodes[0].Endpoint.Address" --output text)
-          echo "REDIS_ENDPOINT=$REDIS_ENDPOINT" >> $GITHUB_ENV
+          REDIS_ENDPOINT=$(aws elasticache describe-cache-clusters \
+            --cache-cluster-id starttech-redis-production \
+            --query "CacheClusters[0].CacheNodes[0].Endpoint.Address" \
+            --output text 2>/dev/null || echo "redis-not-found")
+          echo "REDIS_ENDPOINT=$REDIS_ENDPOINT" >> $GITHUB_OUTPUT
 
-      - name: Deploy to EC2 via SSM
+      - name: Deploy to EC2 instances
         run: |
-          # Get Auto Scaling Group instances
+          # Get running EC2 instances from ASG
           INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names starttech-backend-asg-production \
             --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" \
             --output text)
-
+          
+          if [ -z "$INSTANCE_IDS" ]; then
+            echo "No running instances found in ASG"
+            exit 1
+          fi
+          
+          echo "Deploying to instances: $INSTANCE_IDS"
+          
           for INSTANCE_ID in $INSTANCE_IDS; do
             echo "Deploying to instance: $INSTANCE_ID"
             
-            # Run deployment commands via SSM
             aws ssm send-command \
-              --instance-ids $INSTANCE_ID \
+              --instance-ids "$INSTANCE_ID" \
               --document-name "AWS-RunShellScript" \
-              --comment "Deploy new backend version" \
+              --comment "Deploy new backend container" \
               --parameters commands="[
                 'aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}',
                 'docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest',
-                'docker stop starttech-backend || true',
-                'docker rm starttech-backend || true',
-                'docker run -d --name starttech-backend -p 8080:8080 --restart always \
-                  -e MONGO_URI=\"${{ secrets.MONGO_URI }}\" \
-                  -e JWT_SECRET_KEY=\"${{ secrets.JWT_SECRET_KEY }}\" \
-                  -e REDIS_ADDR=\"$REDIS_ENDPOINT:6379\" \
-                  -e ENABLE_CACHE=true \
-                  -e LOG_LEVEL=INFO \
-                  -e LOG_FORMAT=json \
-                  ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest'
+                'docker stop starttech-backend 2>/dev/null || true',
+                'docker rm starttech-backend 2>/dev/null || true',
+                'docker run -d --name starttech-backend -p 8080:8080 --restart always --log-driver=awslogs --log-opt awslogs-group=/starttech/application --log-opt awslogs-stream=${INSTANCE_ID} -e MONGO_URI=\"${{ secrets.MONGO_URI }}\" -e JWT_SECRET_KEY=\"${{ secrets.JWT_SECRET_KEY }}\" -e REDIS_ADDR=\"${{ steps.redis.outputs.REDIS_ENDPOINT }}:6379\" -e ENABLE_CACHE=true -e LOG_LEVEL=INFO -e LOG_FORMAT=json -e PORT=8080 ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest'
               ]" \
               --output text
           done
+          
+          echo "Deployment commands sent to all instances"
+
+      - name: Wait for instances to be healthy
+        run: |
+          echo "Waiting for instances to be healthy..."
+          sleep 30
+          
+          # Get ALB DNS
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names starttech-alb-production \
+            --query "LoadBalancers[0].DNSName" \
+            --output text)
+          
+          # Check health endpoint
+          for i in {1..10}; do
+            echo "Attempt $i: Checking health..."
+            if curl -f -s "http://$ALB_DNS/health" > /dev/null 2>&1; then
+              echo "Health check passed!"
+              exit 0
+            fi
+            sleep 10
+          done
+          
+          echo "Health check failed after multiple attempts"
+          exit 1
 
       - name: Run smoke tests
         run: |
@@ -165,12 +196,25 @@ jobs:
           echo "Running smoke tests against: http://$ALB_DNS"
           
           # Test health endpoint
-          curl -f http://$ALB_DNS/health || exit 1
+          HEALTH_RESPONSE=$(curl -s "http://$ALB_DNS/health")
+          echo "Health response: $HEALTH_RESPONSE"
           
-          echo "Smoke tests passed!"
+          # Test API endpoint
+          API_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "http://$ALB_DNS/api/v1/health" || echo "000")
+          echo "API health status code: $API_RESPONSE"
+          
+          echo "Smoke tests completed!"
 
       - name: Send notification
         if: always()
         run: |
-          echo "Deployment completed with status: ${{ job.status }}"
-          # Add Slack/Email notification here if needed
+          echo "================================================"
+          echo "Backend deployment status: ${{ job.status }}"
+          
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names starttech-alb-production \
+            --query "LoadBalancers[0].DNSName" \
+            --output text 2>/dev/null || echo "N/A")
+          
+          echo "Backend URL: http://$ALB_DNS"
+          echo "================================================"
