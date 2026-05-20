@@ -1,0 +1,12 @@
+.git
+.gitignore
+.env
+*.test
+*.out
+docs/
+README.md
+Makefile
+docker-compose.yaml
+data/
+tmp/
+vendor/

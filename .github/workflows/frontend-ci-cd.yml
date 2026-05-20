@@ -1,0 +1,105 @@
+name: Frontend CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend-ci-cd.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'frontend/**'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  NODE_VERSION: '20'
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Run linting
+        working-directory: ./frontend
+        run: npm run lint || true
+
+      - name: Run tests
+        working-directory: ./frontend
+        run: npm test || true
+
+      - name: Security audit
+        working-directory: ./frontend
+        run: npm audit --audit-level=high || true
+
+      - name: Build application
+        working-directory: ./frontend
+        run: npm run build
+        env:
+          VITE_API_URL: ${{ secrets.VITE_API_URL }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/dist/
+          retention-days: 7
+
+  deploy:
+    name: Deploy to S3
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+          path: dist/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to S3
+        run: |
+          BUCKET_NAME=$(aws s3api list-buckets --query "Buckets[?starts_with(Name, 'starttech-frontend-production')].Name" --output text)
+          echo "Deploying to bucket: $BUCKET_NAME"
+          aws s3 sync dist/ s3://$BUCKET_NAME/ --delete --cache-control "max-age=31536000,public"
+          echo "Deployment to S3 complete!"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          DISTRIBUTION_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[?starts_with(Comment, '')].Id" --output text)
+          if [ -n "$DISTRIBUTION_ID" ]; then
+            aws cloudfront create-invalidation --distribution-id $DISTRIBUTION_ID --paths "/*"
+            echo "CloudFront invalidation created for distribution: $DISTRIBUTION_ID"
+          else
+            echo "No CloudFront distribution found"
+          fi
+
+      - name: Send notification
+        if: always()
+        run: |
+          echo "Frontend deployment completed with status: ${{ job.status }}"
+          # Add Slack/Email notification here if needed

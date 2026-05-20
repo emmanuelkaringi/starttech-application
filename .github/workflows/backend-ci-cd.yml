@@ -1,0 +1,176 @@
+name: Backend CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend-ci-cd.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'backend/**'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: starttech-backend
+  DOCKER_IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  test:
+    name: Test and Code Quality
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache-dependency-path: backend/go.sum
+
+      - name: Install dependencies
+        working-directory: ./backend
+        run: go mod download
+
+      - name: Run unit tests
+        working-directory: ./backend
+        run: go test ./... -v -short
+
+      - name: Run code quality checks
+        working-directory: ./backend
+        run: |
+          go fmt ./...
+          go vet ./...
+          test -z "$(gofmt -l .)" || (echo "Code is not formatted" && exit 1)
+
+      - name: Run vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: './backend'
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        working-directory: ./backend
+        run: |
+          docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.DOCKER_IMAGE_TAG }} .
+          docker tag ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.DOCKER_IMAGE_TAG }} ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+      - name: Scan Docker image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.DOCKER_IMAGE_TAG }}
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Push to ECR
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.DOCKER_IMAGE_TAG }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Get Redis endpoint
+        run: |
+          REDIS_ENDPOINT=$(aws elasticache describe-cache-clusters --cache-cluster-id starttech-redis-production --query "CacheClusters[0].CacheNodes[0].Endpoint.Address" --output text)
+          echo "REDIS_ENDPOINT=$REDIS_ENDPOINT" >> $GITHUB_ENV
+
+      - name: Deploy to EC2 via SSM
+        run: |
+          # Get Auto Scaling Group instances
+          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names starttech-backend-asg-production \
+            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" \
+            --output text)
+
+          for INSTANCE_ID in $INSTANCE_IDS; do
+            echo "Deploying to instance: $INSTANCE_ID"
+            
+            # Run deployment commands via SSM
+            aws ssm send-command \
+              --instance-ids $INSTANCE_ID \
+              --document-name "AWS-RunShellScript" \
+              --comment "Deploy new backend version" \
+              --parameters commands="[
+                'aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}',
+                'docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest',
+                'docker stop starttech-backend || true',
+                'docker rm starttech-backend || true',
+                'docker run -d --name starttech-backend -p 8080:8080 --restart always \
+                  -e MONGO_URI=\"${{ secrets.MONGO_URI }}\" \
+                  -e JWT_SECRET_KEY=\"${{ secrets.JWT_SECRET_KEY }}\" \
+                  -e REDIS_ADDR=\"$REDIS_ENDPOINT:6379\" \
+                  -e ENABLE_CACHE=true \
+                  -e LOG_LEVEL=INFO \
+                  -e LOG_FORMAT=json \
+                  ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest'
+              ]" \
+              --output text
+          done
+
+      - name: Run smoke tests
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names starttech-alb-production \
+            --query "LoadBalancers[0].DNSName" \
+            --output text)
+          
+          echo "Running smoke tests against: http://$ALB_DNS"
+          
+          # Test health endpoint
+          curl -f http://$ALB_DNS/health || exit 1
+          
+          echo "Smoke tests passed!"
+
+      - name: Send notification
+        if: always()
+        run: |
+          echo "Deployment completed with status: ${{ job.status }}"
+          # Add Slack/Email notification here if needed
