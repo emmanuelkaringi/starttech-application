@@ -83,7 +83,7 @@ jobs:
 
       - name: Deploy to S3
         run: |
-          # Find the frontend bucket
+          # Find the frontend bucket by name prefix
           BUCKET_NAME=$(aws s3api list-buckets --query "Buckets[?starts_with(Name, 'starttech-frontend-production')].Name" --output text)
           
           if [ -z "$BUCKET_NAME" ]; then
@@ -93,45 +93,39 @@ jobs:
           
           echo "Deploying to bucket: $BUCKET_NAME"
           
-          # Sync build files to S3
-          aws s3 sync dist/ s3://$BUCKET_NAME/ --delete \
+          # Sync build files to S3 with proper caching
+          aws s3 sync dist/ "s3://${BUCKET_NAME}/" --delete \
             --cache-control "max-age=3600,public" \
-            --exclude "*.html" \
-            --exclude "asset-manifest.json"
+            --exclude "*.html"
           
-          # HTML files with no cache
-          aws s3 sync dist/ s3://$BUCKET_NAME/ --delete \
+          # HTML files with no-cache
+          aws s3 sync dist/ "s3://${BUCKET_NAME}/" --delete \
             --cache-control "no-cache,no-store,must-revalidate" \
-            --include "*.html" \
-            --include "asset-manifest.json"
+            --include "*.html"
           
           echo "Deployment to S3 complete!"
 
       - name: Invalidate CloudFront cache
         run: |
-          # Find CloudFront distribution
-          DISTRIBUTION_ID=$(aws cloudfront list-distributions \
-            --query "DistributionList.Items[?Origins.Items[?starts_with(DomainName, 'starttech-frontend-production')]].Id" \
-            --output text)
+          # Get all distributions and find the one with our S3 bucket as origin
+          DISTRIBUTION_ID=""
+          
+          # List all distributions and find matching one
+          for dist_id in $(aws cloudfront list-distributions --query "DistributionList.Items[].Id" --output text); do
+            ORIGIN_DOMAIN=$(aws cloudfront get-distribution --id "$dist_id" --query "Distribution.Origins.Items[0].DomainName" --output text)
+            if echo "$ORIGIN_DOMAIN" | grep -q "starttech-frontend-production"; then
+              DISTRIBUTION_ID="$dist_id"
+              break
+            fi
+          done
           
           if [ -n "$DISTRIBUTION_ID" ]; then
-            aws cloudfront create-invalidation --distribution-id $DISTRIBUTION_ID --paths "/*"
-            echo "CloudFront invalidation created for distribution: $DISTRIBUTION_ID"
+            echo "Creating invalidation for distribution: $DISTRIBUTION_ID"
+            aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "/*"
+            echo "CloudFront invalidation created!"
           else
-            echo "Warning: CloudFront distribution not found"
+            echo "Warning: CloudFront distribution not found, skipping invalidation"
           fi
-
-      - name: Verify deployment
-        run: |
-          # Get CloudFront domain
-          CLOUDFRONT_DOMAIN=$(aws cloudfront list-distributions \
-            --query "DistributionList.Items[0].DomainName" \
-            --output text)
-          
-          echo "================================================"
-          echo "Frontend deployed successfully!"
-          echo "CloudFront URL: https://$CLOUDFRONT_DOMAIN"
-          echo "================================================"
 
       - name: Send notification
         if: always()
