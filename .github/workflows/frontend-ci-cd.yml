@@ -65,7 +65,7 @@ jobs:
     name: Deploy to S3
     runs-on: ubuntu-latest
     needs: build-and-test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     
     steps:
       - name: Download build artifacts
@@ -81,53 +81,38 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Get S3 bucket and CloudFront info dynamically
+        id: infra
+        run: |
+          BUCKET_NAME=$(aws s3api list-buckets --query "Buckets[?starts_with(Name, 'starttech-frontend-production')].Name" --output text)
+          echo "BUCKET_NAME=$BUCKET_NAME" >> $GITHUB_OUTPUT
+          
+          CF_DOMAIN=$(aws cloudfront list-distributions --query "DistributionList.Items[0].DomainName" --output text)
+          echo "CF_DOMAIN=$CF_DOMAIN" >> $GITHUB_OUTPUT
+          
+          CF_DIST_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[0].Id" --output text)
+          echo "CF_DIST_ID=$CF_DIST_ID" >> $GITHUB_OUTPUT
+          
+          echo "Bucket: $BUCKET_NAME"
+          echo "CloudFront: $CF_DOMAIN"
+
       - name: Deploy to S3
         run: |
-          # Find the frontend bucket by name prefix
-          BUCKET_NAME=$(aws s3api list-buckets --query "Buckets[?starts_with(Name, 'starttech-frontend-production')].Name" --output text)
-          
-          if [ -z "$BUCKET_NAME" ]; then
-            echo "Error: Frontend S3 bucket not found"
-            exit 1
-          fi
-          
-          echo "Deploying to bucket: $BUCKET_NAME"
-          
-          # Sync build files to S3 with proper caching
-          aws s3 sync dist/ "s3://${BUCKET_NAME}/" --delete \
-            --cache-control "max-age=3600,public" \
-            --exclude "*.html"
-          
-          # HTML files with no-cache
-          aws s3 sync dist/ "s3://${BUCKET_NAME}/" --delete \
-            --cache-control "no-cache,no-store,must-revalidate" \
-            --include "*.html"
-          
+          echo "Deploying to bucket: ${{ steps.infra.outputs.BUCKET_NAME }}"
+          aws s3 sync dist/ "s3://${{ steps.infra.outputs.BUCKET_NAME }}/" --delete
           echo "Deployment to S3 complete!"
 
       - name: Invalidate CloudFront cache
         run: |
-          # Get all distributions and find the one with our S3 bucket as origin
-          DISTRIBUTION_ID=""
-          
-          # List all distributions and find matching one
-          for dist_id in $(aws cloudfront list-distributions --query "DistributionList.Items[].Id" --output text); do
-            ORIGIN_DOMAIN=$(aws cloudfront get-distribution --id "$dist_id" --query "Distribution.Origins.Items[0].DomainName" --output text)
-            if echo "$ORIGIN_DOMAIN" | grep -q "starttech-frontend-production"; then
-              DISTRIBUTION_ID="$dist_id"
-              break
-            fi
-          done
-          
-          if [ -n "$DISTRIBUTION_ID" ]; then
-            echo "Creating invalidation for distribution: $DISTRIBUTION_ID"
-            aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "/*"
-            echo "CloudFront invalidation created!"
-          else
-            echo "Warning: CloudFront distribution not found, skipping invalidation"
-          fi
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.infra.outputs.CF_DIST_ID }}" \
+            --paths "/*"
+          echo "CloudFront invalidation created!"
 
       - name: Send notification
         if: always()
         run: |
-          echo "Frontend deployment completed with status: ${{ job.status }}"
+          echo "================================================"
+          echo "Frontend deployed!"
+          echo "URL: https://${{ steps.infra.outputs.CF_DOMAIN }}"
+          echo "================================================"
