@@ -164,7 +164,7 @@ jobs:
                   \"docker pull ${{ steps.infra.outputs.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest\",
                   \"docker stop starttech-backend 2>/dev/null || true\",
                   \"docker rm starttech-backend 2>/dev/null || true\",
-                  \"docker run -d --name starttech-backend -p 8080:8080 --restart always \
+                  \"docker run -d --name starttech-backend -p 8080:8080 --restart always --log-driver=awslogs --log-opt awslogs-group=/starttech/application --log-opt awslogs-region=us-east-1 --log-opt awslogs-stream=instance-$(curl -s http://169.254.169.254/latest/meta-data/instance-id) \
                     -e MONGO_URI='${{ secrets.MONGO_URI }}' \
                     -e JWT_SECRET_KEY='${{ secrets.JWT_SECRET_KEY }}' \
                     -e REDIS_ADDR='${{ steps.infra.outputs.REDIS_ENDPOINT }}:6379' \
