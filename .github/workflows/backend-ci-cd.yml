@@ -175,7 +175,7 @@ jobs:
                     -e DB_NAME=much_todo_db \
                     -e ALLOWED_ORIGINS='https://${{ steps.infra.outputs.CLOUDFRONT_DOMAIN }}' \
                     -e SECURE_COOKIE=true \
-                    -e COOKIE_DOMAINS='${{ steps.infra.outputs.CLOUDFRONT_DOMAIN }}' \
+                    -e COOKIE_DOMAINS='' \
                     ${{ steps.infra.outputs.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest\",
                   \"sleep 5\",
                   \"docker ps --filter name=starttech-backend\",
