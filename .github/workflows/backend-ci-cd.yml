@@ -108,30 +108,14 @@ jobs:
       - name: Get infrastructure info dynamically
         id: infra
         run: |
-          # Get ALB DNS
-          ALB_DNS=$(aws elbv2 describe-load-balancers \
-            --names starttech-alb-production \
-            --query "LoadBalancers[0].DNSName" \
-            --output text 2>/dev/null || echo "N/A")
+          ALB_DNS=$(aws elbv2 describe-load-balancers --names starttech-alb-production --query "LoadBalancers[0].DNSName" --output text 2>/dev/null || echo "N/A")
           echo "ALB_DNS=$ALB_DNS" >> $GITHUB_OUTPUT
           
-          # Get Redis endpoint
-          REDIS_ENDPOINT=$(aws elasticache describe-cache-clusters \
-            --cache-cluster-id starttech-redis-production \
-            --show-cache-node-info \
-            --query "CacheClusters[0].CacheNodes[0].Endpoint.Address" \
-            --output text 2>/dev/null || echo "N/A")
+          REDIS_ENDPOINT=$(aws elasticache describe-cache-clusters --cache-cluster-id starttech-redis-production --show-cache-node-info --query "CacheClusters[0].CacheNodes[0].Endpoint.Address" --output text 2>/dev/null || echo "N/A")
           echo "REDIS_ENDPOINT=$REDIS_ENDPOINT" >> $GITHUB_OUTPUT
           
-          # Get CloudFront domain dynamically
-          CLOUDFRONT_DOMAIN=$(aws cloudfront list-distributions \
-            --query "DistributionList.Items[0].DomainName" \
-            --output text 2>/dev/null || echo "N/A")
+          CLOUDFRONT_DOMAIN=$(aws cloudfront list-distributions --query "DistributionList.Items[?Origins.Items[?starts_with(DomainName, 'starttech-frontend-production')]].DomainName" --output text 2>/dev/null || echo "N/A")
           echo "CLOUDFRONT_DOMAIN=$CLOUDFRONT_DOMAIN" >> $GITHUB_OUTPUT
-          
-          # Get ECR registry
-          ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
-          echo "ECR_REGISTRY=$ECR_REGISTRY" >> $GITHUB_OUTPUT
           
           echo "ALB DNS: $ALB_DNS"
           echo "Redis: $REDIS_ENDPOINT"
@@ -139,7 +123,6 @@ jobs:
 
       - name: Deploy to EC2 instances via SSM
         run: |
-          # Get running instances
           INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names starttech-backend-asg-production \
             --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" \
@@ -158,30 +141,19 @@ jobs:
             aws ssm send-command \
               --instance-ids "$INSTANCE_ID" \
               --document-name "AWS-RunShellScript" \
-              --parameters "{
-                \"commands\": [
-                  \"aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ steps.infra.outputs.ECR_REGISTRY }}\",
-                  \"docker pull ${{ steps.infra.outputs.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest\",
-                  \"docker stop starttech-backend 2>/dev/null || true\",
-                  \"docker rm starttech-backend 2>/dev/null || true\",
-                  \"docker run -d --name starttech-backend -p 8080:8080 --restart always --log-driver=awslogs --log-opt awslogs-group=/starttech/application --log-opt awslogs-region=us-east-1 --log-opt awslogs-stream=instance-$(curl -s http://169.254.169.254/latest/meta-data/instance-id) \
-                    -e MONGO_URI='${{ secrets.MONGO_URI }}' \
-                    -e JWT_SECRET_KEY='${{ secrets.JWT_SECRET_KEY }}' \
-                    -e REDIS_ADDR='${{ steps.infra.outputs.REDIS_ENDPOINT }}:6379' \
-                    -e ENABLE_CACHE=true \
-                    -e LOG_LEVEL=INFO \
-                    -e LOG_FORMAT=json \
-                    -e PORT=8080 \
-                    -e DB_NAME=much_todo_db \
-                    -e ALLOWED_ORIGINS='https://${{ steps.infra.outputs.CLOUDFRONT_DOMAIN }}' \
-                    -e SECURE_COOKIE=true \
-                    -e COOKIE_DOMAINS='${{ steps.infra.outputs.CLOUDFRONT_DOMAIN }}' \
-                    ${{ steps.infra.outputs.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest\",
-                  \"sleep 5\",
-                  \"docker ps --filter name=starttech-backend\",
-                  \"docker logs --tail 10 starttech-backend\"
+              --parameters '{
+                "commands": [
+                  "LOG_STREAM=instance-$(curl -s http://169.254.169.254/latest/meta-data/instance-id)",
+                  "aws ecr get-login-password --region '"${{ env.AWS_REGION }}"' | docker login --username AWS --password-stdin '"${{ steps.login-ecr.outputs.registry }}"'",
+                  "docker pull '"${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}"':latest",
+                  "docker stop starttech-backend 2>/dev/null || true",
+                  "docker rm starttech-backend 2>/dev/null || true",
+                  "docker run -d --name starttech-backend -p 8080:8080 --restart always --log-driver=awslogs --log-opt awslogs-group=/starttech/application --log-opt awslogs-region='"${{ env.AWS_REGION }}"' --log-opt awslogs-stream=$LOG_STREAM -e MONGO_URI='\''"${{ secrets.MONGO_URI }}"'\'' -e JWT_SECRET_KEY='\''"${{ secrets.JWT_SECRET_KEY }}"'\'' -e REDIS_ADDR='\''"${{ steps.infra.outputs.REDIS_ENDPOINT }}"':6379'\'' -e ENABLE_CACHE=true -e LOG_LEVEL=INFO -e LOG_FORMAT=json -e PORT=8080 -e DB_NAME=much_todo_db -e ALLOWED_ORIGINS='\''https://"${{ steps.infra.outputs.CLOUDFRONT_DOMAIN }}"'\'' -e SECURE_COOKIE=true -e COOKIE_DOMAINS='\''"${{ steps.infra.outputs.CLOUDFRONT_DOMAIN }}"'\'' '"${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}"':latest",
+                  "sleep 5",
+                  "docker ps --filter name=starttech-backend",
+                  "docker logs --tail 10 starttech-backend"
                 ]
-              }" \
+              }' \
               --output text --no-cli-pager
           done
           
@@ -192,20 +164,14 @@ jobs:
           echo "Waiting 30 seconds for containers to stabilize..."
           sleep 30
           
-          # Check target group health via AWS API
-          TG_ARN=$(aws elbv2 describe-target-groups \
-            --names starttech-tg-production \
-            --query "TargetGroups[0].TargetGroupArn" \
-            --output text)
+          TG_ARN=$(aws elbv2 describe-target-groups --names starttech-tg-production --query "TargetGroups[0].TargetGroupArn" --output text)
           
-          aws elbv2 describe-target-health \
-            --target-group-arn "$TG_ARN" \
+          aws elbv2 describe-target-health --target-group-arn "$TG_ARN" \
             --query "TargetHealthDescriptions[].{Instance:Target.Id,Health:TargetHealth.State}" \
             --output table
           
           echo ""
           echo "================================================"
           echo "Deployment complete!"
-          echo "ALB DNS: ${{ steps.infra.outputs.ALB_DNS }}"
           echo "CloudFront URL: https://${{ steps.infra.outputs.CLOUDFRONT_DOMAIN }}"
           echo "================================================"
